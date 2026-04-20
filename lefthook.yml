@@ -1,0 +1,16 @@
+# https://lefthook.dev/
+pre-commit:
+  parallel: true
+  jobs:
+    - name: golangci-lint
+      glob: "*.go"
+      run: golangci-lint run --fix ./...
+      stage_fixed: true
+    - name: gofumpt
+      glob: "*.go"
+      run: golangci-lint fmt {staged_files}
+      stage_fixed: true
+    - name: go-mod-tidy
+      glob: "go.{mod,sum}"
+      run: go mod tidy
+      stage_fixed: true
