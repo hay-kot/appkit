@@ -15,10 +15,6 @@ func runWithRetry(ctx context.Context, p Plugin, opts *managerOpts) error {
 	var lastErr error
 
 	for attempt := range runCount {
-		if ctx.Err() != nil {
-			return nil
-		}
-
 		err := safeStart(ctx, p)
 		if err == nil {
 			return nil
