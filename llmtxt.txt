@@ -1,0 +1,304 @@
+# appkit — Application Development Kit
+
+> github.com/hay-kot/appkit
+
+Zero-dependency Go utility library providing reusable packages for building
+applications. All packages are independent and can be imported individually.
+
+Install: go get github.com/hay-kot/appkit
+
+---
+
+## Package: concurrency
+
+Import: github.com/hay-kot/appkit/concurrency
+
+Bounded-parallel work execution with first-error-wins semantics. All helpers
+propagate cancellation to in-flight workers via the ctx argument.
+
+### ForEach
+
+    func ForEach(ctx context.Context, n int, concurrency int, fn func(ctx context.Context, idx int) error) error
+
+Runs fn for each index in [0, n) using at most `concurrency` goroutines.
+Cancels all workers on first error and returns once all workers observe
+the cancellation.
+
+### ForEachMergeResults
+
+    func ForEachMergeResults[J, R any](ctx context.Context, jobs []J, concurrency int, fn func(ctx context.Context, job J) ([]R, error)) ([]R, error)
+
+Like ForEach but each fn call returns results that are merged into a single
+slice. Discards partial results on error.
+
+### Pool
+
+    type Pool struct{ ... }
+    func NewPool(workers, queueSize int, opts ...PoolOption) *Pool
+    func (p *Pool) Submit(ctx context.Context, job Job) error
+    func (p *Pool) TrySubmit(job Job) bool
+    func (p *Pool) Close()
+
+Fixed-size worker pool with bounded job queue. Submit blocks when the queue
+is full; TrySubmit returns false instead. Close waits for in-flight jobs to
+finish.
+
+    type Job func(ctx context.Context)
+    type PoolOption func(*poolConfig)
+    func WithPanicHandler(fn func(recovered any)) PoolOption
+
+Example:
+
+    pool := concurrency.NewPool(4, 100)
+    defer pool.Close()
+
+    pool.Submit(ctx, func(ctx context.Context) {
+        // work
+    })
+
+---
+
+## Package: dockertest
+
+Import: github.com/hay-kot/appkit/dockertest
+
+Zero-dependency Docker container harness for Go tests. Shells out to the
+docker CLI via os/exec rather than binding the Docker API.
+
+### Starting a Container
+
+    func Run(ctx context.Context, opts Options) (*Container, error)
+    func Start(tb testing.TB, opts Options) *Container
+
+Run starts a container and waits for readiness. Start wraps Run and
+registers tb.Cleanup for automatic teardown.
+
+    type Options struct {
+        Image    string            // required, e.g. "postgres:17"
+        Name     string            // auto-generated if empty
+        Env      map[string]string // environment variables
+        Cmd      []string          // command override
+        Ports    []string          // container ports to publish
+        Labels   map[string]string
+        Wait     Wait              // readiness check
+        Platform string            // e.g. "linux/amd64"
+    }
+
+### Container
+
+    type Container struct {
+        ID   string
+        Name string
+    }
+    func (c *Container) Host() string
+    func (c *Container) MappedPort(ctx context.Context, containerPort string) (string, error)
+    func (c *Container) Endpoint(ctx context.Context, containerPort string) (string, error)
+    func (c *Container) Exec(ctx context.Context, cmd ...string) (ExecResult, error)
+    func (c *Container) Logs(ctx context.Context) (io.ReadCloser, error)
+    func (c *Container) Terminate(ctx context.Context) error
+
+### Readiness Checks
+
+    type Wait interface {
+        WaitReady(ctx context.Context, c *Container) error
+    }
+
+    func WaitForListeningPort(containerPort string) *ListeningPortWait
+    func WaitForLog(pattern string) *LogWait
+    func WaitForHTTP(containerPort, path string, want int) *HTTPWait
+    func WaitForExec(cmd ...string) *ExecWait
+    func WaitAll(waits ...Wait) *AllWait
+
+Example:
+
+    c := dockertest.Start(t, dockertest.Options{
+        Image: "postgres:17",
+        Env:   map[string]string{"POSTGRES_PASSWORD": "test"},
+        Ports: []string{"5432"},
+        Wait:  dockertest.WaitForListeningPort("5432"),
+    })
+
+    port, _ := c.MappedPort(ctx, "5432")
+    dsn := fmt.Sprintf("postgres://postgres:test@127.0.0.1:%s/postgres?sslmode=disable", port)
+
+---
+
+## Package: httpclient
+
+Import: github.com/hay-kot/appkit/httpclient
+
+Context-first HTTP client with composable middleware. Wraps net/http.Client
+to reduce per-call boilerplate (base URL joining, auth headers, JSON body
+handling) without hiding net/http semantics.
+
+### Client
+
+    func New(httpClient *http.Client, baseURL string, mws ...Middleware) *Client
+    func (c *Client) Do(req *http.Request, mws ...Middleware) (*http.Response, error)
+    func (c *Client) Get(ctx context.Context, path string, mws ...Middleware) (*http.Response, error)
+    func (c *Client) Post(ctx context.Context, path string, body io.Reader, mws ...Middleware) (*http.Response, error)
+    func (c *Client) Put(ctx context.Context, path string, body io.Reader, mws ...Middleware) (*http.Response, error)
+    func (c *Client) Patch(ctx context.Context, path string, body io.Reader, mws ...Middleware) (*http.Response, error)
+    func (c *Client) Delete(ctx context.Context, path string, mws ...Middleware) (*http.Response, error)
+
+### Middleware
+
+    type Doer interface {
+        Do(req *http.Request) (*http.Response, error)
+    }
+    type Middleware func(Doer) Doer
+    type DoerFunc func(*http.Request) (*http.Response, error)
+
+    func BearerAuth(token func() string) Middleware
+    func JSONContent() Middleware
+    func Header(key, value string) Middleware
+
+### Helpers
+
+    func DecodeJSON[T any](r *http.Response) (T, error)
+    func JSONBody(v any) *bytes.Reader
+
+Example:
+
+    client := httpclient.New(http.DefaultClient, "https://api.example.com",
+        httpclient.BearerAuth(func() string { return os.Getenv("API_TOKEN") }),
+        httpclient.JSONContent(),
+    )
+
+    resp, err := client.Post(ctx, "/items", httpclient.JSONBody(item))
+    if err != nil {
+        return err
+    }
+    result, err := httpclient.DecodeJSON[Item](resp)
+
+---
+
+## Package: mapx
+
+Import: github.com/hay-kot/appkit/mapx
+
+Generic mapping helpers for type conversion with slice and error-propagating
+variants.
+
+### MapFunc
+
+    type MapFunc[T, U any] func(T) U
+    func (fn MapFunc[T, U]) Slice(v []T) []U
+    func (fn MapFunc[T, U]) Err(v T, err error) (U, error)
+    func (fn MapFunc[T, U]) SliceErr(v []T, err error) ([]U, error)
+
+Example:
+
+    toDTO := mapx.MapFunc[domain.User, api.UserResponse](func(u domain.User) api.UserResponse {
+        return api.UserResponse{ID: u.ID, Name: u.Name}
+    })
+
+    users, err := repo.ListUsers(ctx)
+    dtos, err := toDTO.SliceErr(users, err)
+
+---
+
+## Package: plugs
+
+Import: github.com/hay-kot/appkit/plugs
+
+Service lifecycle manager for concurrent long-running services. Starts
+plugins concurrently, captures panics, optionally retries transient failures,
+and coordinates graceful shutdown on signals or explicit Shutdown calls.
+
+### Plugin Interface
+
+    type Plugin interface {
+        Name() string
+        Start(ctx context.Context) error
+    }
+    func PluginFunc(name string, start func(ctx context.Context) error) Plugin
+
+### Manager
+
+    func New(opts ...Option) *Manager
+    func (m *Manager) Add(p ...Plugin)
+    func (m *Manager) AddFunc(name string, start func(ctx context.Context) error)
+    func (m *Manager) Start(ctx context.Context) error
+    func (m *Manager) Shutdown()
+
+### Options
+
+    func WithSignals(sigs ...os.Signal) Option    // default: SIGINT, SIGTERM
+    func WithTimeout(d time.Duration) Option       // default: 5s
+    func WithLogger(l Logger) Option
+    func WithMaxAttempts(n int) Option             // default: 1 (no retries)
+    func WithBackoff(fn BackoffFunc) Option
+
+    type BackoffFunc func(attempt int) time.Duration
+    func DefaultBackoff(attempt int) time.Duration // exponential: 100ms..5s
+
+### Error Types
+
+    var ErrManagerAlreadyStarted
+    type PluginErrors []error
+    type PanicError struct { Name string; Value any }
+
+Example:
+
+    mgr := plugs.New(
+        plugs.WithLogger(slogAdapter),
+        plugs.WithMaxAttempts(3),
+    )
+
+    mgr.AddFunc("http", func(ctx context.Context) error {
+        srv := &http.Server{Addr: ":8080", Handler: mux}
+        go func() { <-ctx.Done(); srv.Shutdown(context.Background()) }()
+        return srv.ListenAndServe()
+    })
+
+    mgr.AddFunc("worker", func(ctx context.Context) error {
+        for { select { case <-ctx.Done(): return nil } }
+    })
+
+    if err := mgr.Start(ctx); err != nil {
+        log.Fatal(err)
+    }
+
+---
+
+## Package: secret
+
+Import: github.com/hay-kot/appkit/secret
+
+String type that resolves secrets from environment variables, files, or
+caller-registered sources during unmarshaling. Safe for use in config
+structs — String() and MarshalText/JSON always return "[redacted]".
+
+### Secret
+
+    type Secret struct{ ... }
+    func (s Secret) Value() string              // panics if not unmarshaled
+    func (s Secret) String() string             // always "[redacted]"
+    func (s Secret) MarshalText() ([]byte, error)
+    func (s *Secret) UnmarshalText([]byte) error
+    func (s Secret) MarshalJSON() ([]byte, error)
+    func (s *Secret) UnmarshalJSON([]byte) error
+
+### Resolvers
+
+    type Resolver func(value string) (string, error)
+    func Register(prefix string, fn Resolver)
+
+Built-in prefixes:
+- "env:VAR_NAME"   — reads os.Getenv(VAR_NAME)
+- "file:/path"     — reads file contents, strips trailing newlines
+- plain strings    — passed through as-is
+
+Example (YAML/JSON config):
+
+    type Config struct {
+        DatabaseURL secret.Secret `json:"database_url"`
+        APIKey      secret.Secret `json:"api_key"`
+    }
+
+    // config.json:
+    // { "database_url": "env:DATABASE_URL", "api_key": "file:/run/secrets/api_key" }
+
+    cfg.DatabaseURL.Value() // returns the resolved environment variable
+    fmt.Println(cfg.APIKey) // prints "[redacted]"
