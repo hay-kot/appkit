@@ -12,11 +12,13 @@
 //	})
 //	addr, _ := c.Endpoint(ctx, "6379/tcp")
 //
-// Use [Run] from TestMain or other non-*testing.T contexts; the caller is
-// responsible for calling [Container.Terminate].
+// Use [StartMain] from TestMain for the same convenience with automatic
+// teardown, or [Run] when you need full control over the container lifecycle.
 //
-// Host ports are always assigned by Docker on 127.0.0.1. Resolve them with
-// [Container.MappedPort] or [Container.Endpoint].
+// Host ports are published on 127.0.0.1 by default (override with
+// [Options.BindHost]). Resolve them with [Container.MappedPort] or
+// [Container.Endpoint]. In Docker-in-Docker environments where host ports are
+// unreachable, use [Container.InternalIP] to dial the container directly.
 package dockertest
 
 import (
@@ -27,6 +29,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -69,6 +72,11 @@ type Options struct {
 	// Platform sets --platform, e.g. "linux/amd64" on arm64 hosts running
 	// images without a native arm64 build.
 	Platform string
+
+	// BindHost is the host interface for published ports. Defaults to
+	// "127.0.0.1". Set to "0.0.0.0" when tests run inside a container
+	// that needs to reach ports on the Docker host.
+	BindHost string
 }
 
 // Container is a handle to a running Docker container.
@@ -78,6 +86,7 @@ type Container struct {
 	// Name is the container name (either Options.Name or a generated value).
 	Name string
 
+	host   string
 	portMu sync.RWMutex
 	ports  map[string]string // normalized container port → host port
 }
@@ -99,6 +108,11 @@ func Run(ctx context.Context, opts Options) (*Container, error) {
 		name = "appkit-" + suffix
 	}
 
+	bindHost := opts.BindHost
+	if bindHost == "" {
+		bindHost = "127.0.0.1"
+	}
+
 	args := []string{"run", "-d", "--name", name, "--label", LabelKey + "=1"}
 	for k, v := range opts.Labels {
 		args = append(args, "--label", k+"="+v)
@@ -107,7 +121,7 @@ func Run(ctx context.Context, opts Options) (*Container, error) {
 		args = append(args, "-e", k+"="+v)
 	}
 	for _, p := range opts.Ports {
-		args = append(args, "-p", "127.0.0.1::"+normalizePort(p))
+		args = append(args, "-p", bindHost+"::"+normalizePort(p))
 	}
 	if opts.Platform != "" {
 		args = append(args, "--platform", opts.Platform)
@@ -127,6 +141,7 @@ func Run(ctx context.Context, opts Options) (*Container, error) {
 	c := &Container{
 		ID:    strings.TrimSpace(string(out)),
 		Name:  name,
+		host:  bindHost,
 		ports: make(map[string]string),
 	}
 
@@ -164,9 +179,56 @@ func Start(tb testing.TB, opts Options) *Container {
 	return c
 }
 
-// Host returns the host interface containers are published on. It is always
-// "127.0.0.1".
-func (c *Container) Host() string { return "127.0.0.1" }
+// StartMain calls [Run] and returns the container along with an exit function
+// that terminates the container and calls [os.Exit]. It is intended for use in
+// TestMain where [testing.TB] is not available:
+//
+//	var testDB *dockertest.Container
+//
+//	func TestMain(m *testing.M) {
+//		var exit func(int)
+//		testDB, exit = dockertest.StartMain(dockertest.Options{...})
+//		exit(m.Run())
+//	}
+func StartMain(opts Options) (*Container, func(code int)) {
+	c, err := Run(context.Background(), opts)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "dockertest: %v\n", err)
+		os.Exit(1)
+	}
+	return c, func(code int) {
+		_ = c.Terminate(context.Background())
+		os.Exit(code)
+	}
+}
+
+// Host returns the host interface containers are published on. It defaults to
+// "127.0.0.1" unless [Options.BindHost] was set.
+func (c *Container) Host() string {
+	if c.host == "" {
+		return "127.0.0.1"
+	}
+	return c.host
+}
+
+// InternalIP returns the container's IP address on the Docker bridge network.
+// This is useful in Docker-in-Docker (DinD) or containerized CI environments
+// where the host's loopback interface is unreachable. The returned IP can be
+// dialed directly using the container port (not the mapped host port).
+func (c *Container) InternalIP(ctx context.Context) (string, error) {
+	out, err := exec.CommandContext(ctx, "docker", "inspect",
+		"-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
+		c.Name,
+	).Output()
+	if err != nil {
+		return "", fmt.Errorf("dockertest: docker inspect %s: %w", c.Name, err)
+	}
+	ip := strings.TrimSpace(string(out))
+	if ip == "" {
+		return "", fmt.Errorf("dockertest: no internal IP for %s", c.Name)
+	}
+	return ip, nil
+}
 
 // MappedPort returns the host port assigned to containerPort. containerPort
 // may be "5432" or "5432/tcp"; the "/tcp" suffix is added if missing.

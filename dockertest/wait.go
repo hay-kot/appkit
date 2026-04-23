@@ -17,6 +17,16 @@ type Wait interface {
 	WaitReady(ctx context.Context, c *Container) error
 }
 
+// WaitFunc adapts an ordinary function to the [Wait] interface. Use it for
+// one-off protocol-level probes (SQL ping, Redis PING, etc.) that don't fit
+// the built-in wait strategies.
+type WaitFunc func(ctx context.Context, c *Container) error
+
+// WaitReady implements [Wait].
+func (f WaitFunc) WaitReady(ctx context.Context, c *Container) error {
+	return f(ctx, c)
+}
+
 // ListeningPortWait dials the container's mapped host port until a TCP
 // connection succeeds.
 type ListeningPortWait struct {
