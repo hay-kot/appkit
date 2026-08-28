@@ -8,8 +8,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 )
 
@@ -79,12 +81,99 @@ func (c *Client) Delete(ctx context.Context, path string, mws ...Middleware) (*h
 	return c.do(ctx, http.MethodDelete, path, nil, mws)
 }
 
+// GetJSON issues a GET request and decodes the response into T, collapsing
+// the [Client.Get] plus [DecodeJSON] pair into a single call:
+//
+//	u, err := client.GetJSON[User](ctx, "/users/1")
+//
+// The body is always closed. Unlike [DecodeJSON], which leaves status
+// handling to the caller holding the response, the JSON methods close the
+// response and so report a non-2xx status as a [*StatusError]. A 2xx with an
+// empty body (204 and friends) yields the zero T and a nil error.
+func (c *Client) GetJSON[T any](ctx context.Context, path string, mws ...Middleware) (T, error) {
+	return c.doJSON[T](ctx, http.MethodGet, path, nil, mws)
+}
+
+// PostJSON issues a POST request with body and decodes the response into T.
+// Semantics match [Client.GetJSON]. Use [JSONBody] to send a value as the
+// request body.
+func (c *Client) PostJSON[T any](ctx context.Context, path string, body io.Reader, mws ...Middleware) (T, error) {
+	return c.doJSON[T](ctx, http.MethodPost, path, body, mws)
+}
+
+// PutJSON issues a PUT request with body and decodes the response into T.
+// Semantics match [Client.GetJSON].
+func (c *Client) PutJSON[T any](ctx context.Context, path string, body io.Reader, mws ...Middleware) (T, error) {
+	return c.doJSON[T](ctx, http.MethodPut, path, body, mws)
+}
+
+// PatchJSON issues a PATCH request with body and decodes the response into T.
+// Semantics match [Client.GetJSON].
+func (c *Client) PatchJSON[T any](ctx context.Context, path string, body io.Reader, mws ...Middleware) (T, error) {
+	return c.doJSON[T](ctx, http.MethodPatch, path, body, mws)
+}
+
+// DeleteJSON issues a DELETE request and decodes the response into T.
+// Semantics match [Client.GetJSON]; endpoints that answer 204 give the zero T
+// and a nil error, so struct{} is a reasonable T when nothing is returned.
+func (c *Client) DeleteJSON[T any](ctx context.Context, path string, mws ...Middleware) (T, error) {
+	return c.doJSON[T](ctx, http.MethodDelete, path, nil, mws)
+}
+
+// DoJSON sends a caller-constructed request through the middleware chain and
+// decodes the response into T. Semantics match [Client.GetJSON]; reach for it
+// when the verb shortcuts cannot express the request.
+func (c *Client) DoJSON[T any](req *http.Request, mws ...Middleware) (T, error) {
+	resp, err := wrap(c.doer, mws).Do(req)
+	if err != nil {
+		var zero T
+		return zero, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	return decodeResponse[T](resp)
+}
+
 func (c *Client) do(ctx context.Context, method, path string, body io.Reader, mws []Middleware) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, method, c.url(path), body)
 	if err != nil {
 		return nil, err
 	}
 	return wrap(c.doer, mws).Do(req)
+}
+
+// doJSON dispatches a request and hands the response to decodeResponse. It
+// mirrors do, which the non-JSON verb shortcuts share.
+func (c *Client) doJSON[T any](ctx context.Context, method, path string, body io.Reader, mws []Middleware) (T, error) {
+	resp, err := c.do(ctx, method, path, body, mws)
+	if err != nil {
+		var zero T
+		return zero, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	return decodeResponse[T](resp)
+}
+
+// decodeResponse decodes a 2xx JSON body into T. Closing the body stays with
+// the caller that obtained the response.
+func decodeResponse[T any](r *http.Response) (T, error) {
+	var zero T
+
+	if r.StatusCode < 200 || r.StatusCode >= 300 {
+		return zero, newStatusError(r)
+	}
+
+	var out T
+	err := json.NewDecoder(r.Body).Decode(&out)
+	if errors.Is(err, io.EOF) {
+		// Nothing at all in the body. The zero value is the honest answer
+		// for a 204, and reporting io.EOF would push that check onto every
+		// caller of an endpoint that sometimes returns no content.
+		return zero, nil
+	}
+	if err != nil {
+		return zero, err
+	}
+	return out, nil
 }
 
 // wrap applies mws to base in registration order: the first middleware is
@@ -122,6 +211,10 @@ func hasSchemePrefix(s, scheme string) bool {
 //	resp, err := client.Get(ctx, "/users/1")
 //	if err != nil { return err }
 //	u, err := httpclient.DecodeJSON[User](resp)
+//
+// The status code is left to the caller, who still holds the response.
+// [Client.GetJSON] and the other JSON methods are the one-call form and check
+// it for you.
 func DecodeJSON[T any](r *http.Response) (T, error) {
 	var out T
 	defer func() { _ = r.Body.Close() }()
@@ -138,4 +231,77 @@ func JSONBody(v any) *bytes.Reader {
 		panic("httpclient: failed to marshal JSON body: " + err.Error())
 	}
 	return bytes.NewReader(data)
+}
+
+// maxStatusErrorBody caps how much of a failed response body a [StatusError]
+// keeps. The snippet exists to make a log line diagnosable; a full HTML error
+// page held in memory (and pasted into every log line) is not worth it.
+const maxStatusErrorBody = 1 << 10
+
+// StatusError reports a response outside the 2xx range from one of the JSON
+// methods on [Client]. Those methods close the body before returning, so the
+// error carries the details a caller would otherwise read off the response:
+//
+//	u, err := client.GetJSON[User](ctx, "/users/1")
+//	var statusErr *httpclient.StatusError
+//	if errors.As(err, &statusErr) && statusErr.StatusCode == http.StatusNotFound {
+//		return ErrNoUser
+//	}
+type StatusError struct {
+	// Method and URL identify the request that was answered. Both are empty
+	// when a middleware synthesizes a response without a request attached,
+	// and the URL has any password redacted.
+	Method string
+	URL    string
+
+	// Status is the full status line ("404 Not Found") and StatusCode the
+	// numeric part.
+	Status     string
+	StatusCode int
+
+	// Body is the leading 1 KiB of the response body with surrounding space
+	// trimmed, or empty if the body was empty or could not be read.
+	Body string
+}
+
+// Error returns the request, status, and body snippet, omitting whichever of
+// those the response did not carry.
+func (e *StatusError) Error() string {
+	status := e.Status
+	if status == "" {
+		status = strconv.Itoa(e.StatusCode)
+	}
+
+	var b strings.Builder
+	b.WriteString("httpclient: ")
+	if e.Method != "" && e.URL != "" {
+		b.WriteString(e.Method)
+		b.WriteByte(' ')
+		b.WriteString(e.URL)
+		b.WriteString(": ")
+	}
+	b.WriteString(status)
+	if e.Body != "" {
+		b.WriteString(": ")
+		b.WriteString(e.Body)
+	}
+	return b.String()
+}
+
+// newStatusError builds a StatusError from a non-2xx response. It reads from
+// the body but does not close it; the caller owns that.
+func newStatusError(r *http.Response) *StatusError {
+	e := &StatusError{Status: r.Status, StatusCode: r.StatusCode}
+	if r.Request != nil {
+		e.Method = r.Request.Method
+		if r.Request.URL != nil {
+			e.URL = r.Request.URL.Redacted()
+		}
+	}
+	// A read failure must not mask the status the caller actually needs, so
+	// an unreadable body just leaves the snippet empty.
+	if body, err := io.ReadAll(io.LimitReader(r.Body, maxStatusErrorBody)); err == nil {
+		e.Body = strings.TrimSpace(string(body))
+	}
+	return e
 }

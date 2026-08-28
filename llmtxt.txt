@@ -6,6 +6,7 @@ Zero-dependency Go utility library providing reusable packages for building
 applications. All packages are independent and can be imported individually.
 
 Install: go get github.com/hay-kot/appkit
+Requires: Go 1.27 or newer
 
 ---
 
@@ -141,6 +142,28 @@ handling) without hiding net/http semantics.
     func (c *Client) Patch(ctx context.Context, path string, body io.Reader, mws ...Middleware) (*http.Response, error)
     func (c *Client) Delete(ctx context.Context, path string, mws ...Middleware) (*http.Response, error)
 
+### JSON methods (generic methods, Go 1.27)
+
+Decode the response into T in one call. The body is always closed, a non-2xx
+status returns a *StatusError instead of a decode error, and a 2xx with an
+empty body (204) returns the zero T and a nil error.
+
+    func (c *Client) GetJSON[T any](ctx context.Context, path string, mws ...Middleware) (T, error)
+    func (c *Client) PostJSON[T any](ctx context.Context, path string, body io.Reader, mws ...Middleware) (T, error)
+    func (c *Client) PutJSON[T any](ctx context.Context, path string, body io.Reader, mws ...Middleware) (T, error)
+    func (c *Client) PatchJSON[T any](ctx context.Context, path string, body io.Reader, mws ...Middleware) (T, error)
+    func (c *Client) DeleteJSON[T any](ctx context.Context, path string, mws ...Middleware) (T, error)
+    func (c *Client) DoJSON[T any](req *http.Request, mws ...Middleware) (T, error)
+
+    type StatusError struct {
+        Method     string // empty if the response carried no request
+        URL        string // password redacted
+        Status     string // "404 Not Found"
+        StatusCode int
+        Body       string // leading 1 KiB of the response body, space-trimmed
+    }
+    func (e *StatusError) Error() string
+
 ### Middleware
 
     type Doer interface {
@@ -164,6 +187,20 @@ Example:
         httpclient.BearerAuth(func() string { return os.Getenv("API_TOKEN") }),
         httpclient.JSONContent(),
     )
+
+    item, err := client.GetJSON[Item](ctx, "/items/1")
+    if err != nil {
+        var statusErr *httpclient.StatusError
+        if errors.As(err, &statusErr) && statusErr.StatusCode == http.StatusNotFound {
+            return ErrNoItem
+        }
+        return err
+    }
+
+    created, err := client.PostJSON[Item](ctx, "/items", httpclient.JSONBody(item))
+
+Use the verb methods plus DecodeJSON when the response itself is needed
+(headers, status, streaming); DecodeJSON leaves the status check to you.
 
     resp, err := client.Post(ctx, "/items", httpclient.JSONBody(item))
     if err != nil {
