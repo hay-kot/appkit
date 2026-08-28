@@ -1,3 +1,3 @@
 module github.com/hay-kot/appkit
 
-go 1.25
+go 1.27

@@ -12,6 +12,8 @@ Application development kit
 go get github.com/hay-kot/appkit
 ```
 
+Requires Go 1.27 or newer.
+
 ## Packages
 
 | Package                                                                   | Import                                  | Description                                                         |
