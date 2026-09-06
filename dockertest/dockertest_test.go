@@ -25,7 +25,16 @@ import (
 const (
 	httpEchoImage = "hashicorp/http-echo:0.2.3"
 	alpineImage   = "alpine:3.20"
+
+	// echoTextFlag makes http-echo serve the body "hello" on echoPort.
+	echoTextFlag = "-text=hello"
+	echoPort     = "5678/tcp"
 )
+
+// keepAlive holds an alpine container open for longer than any test needs. It
+// returns a fresh slice so a caller cannot mutate the command of a parallel
+// test.
+func keepAlive() []string { return []string{"sleep", "600"} }
 
 var dockerOK bool
 
@@ -85,9 +94,9 @@ func TestRun_Lifecycle(t *testing.T) {
 
 	c, err := dockertest.Run(ctx, dockertest.Options{
 		Image: httpEchoImage,
-		Cmd:   []string{"-text=hello"},
-		Ports: []string{"5678/tcp"},
-		Wait:  dockertest.WaitForListeningPort("5678/tcp"),
+		Cmd:   []string{echoTextFlag},
+		Ports: []string{echoPort},
+		Wait:  dockertest.WaitForListeningPort(echoPort),
 	})
 	if err != nil {
 		t.Fatalf("Run: %v", err)
@@ -111,7 +120,7 @@ func TestRun_CustomName(t *testing.T) {
 	c, err := dockertest.Run(ctx, dockertest.Options{
 		Image: alpineImage,
 		Name:  name,
-		Cmd:   []string{"sleep", "600"},
+		Cmd:   keepAlive(),
 	})
 	if err != nil {
 		t.Fatalf("Run: %v", err)
@@ -145,12 +154,12 @@ func TestEndpoint_ReturnsHostPort(t *testing.T) {
 
 	c := dockertest.Start(t, dockertest.Options{
 		Image: httpEchoImage,
-		Cmd:   []string{"-text=hello"},
-		Ports: []string{"5678/tcp"},
-		Wait:  dockertest.WaitForListeningPort("5678/tcp"),
+		Cmd:   []string{echoTextFlag},
+		Ports: []string{echoPort},
+		Wait:  dockertest.WaitForListeningPort(echoPort),
 	})
 
-	addr, err := c.Endpoint(ctx, "5678/tcp")
+	addr, err := c.Endpoint(ctx, echoPort)
 	if err != nil {
 		t.Fatalf("Endpoint: %v", err)
 	}
@@ -159,7 +168,7 @@ func TestEndpoint_ReturnsHostPort(t *testing.T) {
 	}
 
 	// containerPort normalization: "5678" and "5678/tcp" should resolve equally.
-	p1, err := c.MappedPort(ctx, "5678/tcp")
+	p1, err := c.MappedPort(ctx, echoPort)
 	if err != nil {
 		t.Fatalf("MappedPort(5678/tcp): %v", err)
 	}
@@ -179,12 +188,12 @@ func TestWaitForHTTP(t *testing.T) {
 
 	c := dockertest.Start(t, dockertest.Options{
 		Image: httpEchoImage,
-		Cmd:   []string{"-text=hello"},
-		Ports: []string{"5678/tcp"},
-		Wait:  dockertest.WaitForHTTP("5678/tcp", "/", 200),
+		Cmd:   []string{echoTextFlag},
+		Ports: []string{echoPort},
+		Wait:  dockertest.WaitForHTTP(echoPort, "/", 200),
 	})
 
-	addr, err := c.Endpoint(ctx, "5678/tcp")
+	addr, err := c.Endpoint(ctx, echoPort)
 	if err != nil {
 		t.Fatalf("Endpoint: %v", err)
 	}
@@ -206,8 +215,8 @@ func TestWaitForLog(t *testing.T) {
 
 	c, err := dockertest.Run(ctx, dockertest.Options{
 		Image: httpEchoImage,
-		Cmd:   []string{"-text=hello"},
-		Ports: []string{"5678/tcp"},
+		Cmd:   []string{echoTextFlag},
+		Ports: []string{echoPort},
 		Wait:  dockertest.WaitForLog(`listening`),
 	})
 	if err != nil {
@@ -222,7 +231,7 @@ func TestWaitForExec(t *testing.T) {
 
 	_ = dockertest.Start(t, dockertest.Options{
 		Image: alpineImage,
-		Cmd:   []string{"sleep", "600"},
+		Cmd:   keepAlive(),
 		Wait:  dockertest.WaitForExec("/bin/true"),
 	})
 }
@@ -233,12 +242,12 @@ func TestWaitAll_RunsInOrder(t *testing.T) {
 
 	_ = dockertest.Start(t, dockertest.Options{
 		Image: httpEchoImage,
-		Cmd:   []string{"-text=hello"},
-		Ports: []string{"5678/tcp"},
+		Cmd:   []string{echoTextFlag},
+		Ports: []string{echoPort},
 		Wait: dockertest.WaitAll(
 			dockertest.WaitForLog(`listening`),
-			dockertest.WaitForListeningPort("5678/tcp"),
-			dockertest.WaitForHTTP("5678/tcp", "/", 200),
+			dockertest.WaitForListeningPort(echoPort),
+			dockertest.WaitForHTTP(echoPort, "/", 200),
 		),
 	})
 }
@@ -251,7 +260,7 @@ func TestWaitReady_ReturnsOnCtxCancel(t *testing.T) {
 	// will loop until ctx expires.
 	c := dockertest.Start(t, dockertest.Options{
 		Image: alpineImage,
-		Cmd:   []string{"sleep", "600"},
+		Cmd:   keepAlive(),
 	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
@@ -282,7 +291,7 @@ func TestRun_WaitFailurePropagatesAndCleansUp(t *testing.T) {
 	_, err := dockertest.Run(ctx, dockertest.Options{
 		Image: alpineImage,
 		Name:  name,
-		Cmd:   []string{"sleep", "600"},
+		Cmd:   keepAlive(),
 		Wait:  dockertest.WaitForListeningPort("9999/tcp"),
 	})
 	if err == nil {
@@ -304,7 +313,7 @@ func TestExec_StdoutStderrExitCode(t *testing.T) {
 
 	c := dockertest.Start(t, dockertest.Options{
 		Image: alpineImage,
-		Cmd:   []string{"sleep", "600"},
+		Cmd:   keepAlive(),
 	})
 
 	res, err := c.Exec(ctx, "sh", "-c", "echo out; echo err 1>&2; exit 3")
@@ -367,7 +376,7 @@ func TestStart_RegistersCleanup(t *testing.T) {
 	t.Run("inner", func(t *testing.T) {
 		c := dockertest.Start(t, dockertest.Options{
 			Image: alpineImage,
-			Cmd:   []string{"sleep", "600"},
+			Cmd:   keepAlive(),
 		})
 		name = c.Name
 	})
@@ -386,7 +395,7 @@ func TestTerminate_IsIdempotentForMissingContainer(t *testing.T) {
 
 	c := dockertest.Start(t, dockertest.Options{
 		Image: alpineImage,
-		Cmd:   []string{"sleep", "600"},
+		Cmd:   keepAlive(),
 	})
 	if err := c.Terminate(context.Background()); err != nil {
 		t.Fatalf("first Terminate: %v", err)
