@@ -266,15 +266,20 @@ Example:
 
 Import: github.com/hay-kot/appkit/secret
 
-String type that resolves secrets from environment variables, files, or
+Secret type that resolves secrets from environment variables, files, or
 caller-registered sources during unmarshaling. Safe for use in config
-structs — String() and MarshalText/JSON always return "[redacted]".
+structs — the resolved value never leaves the type. Printing and marshaling
+emit the source reference ("env:DATABASE_URL") so config round-trips, and
+fall back to "[redacted]" for literal values, which have no reference.
 
 ### Secret
 
     type Secret struct{ ... }
-    func (s Secret) Value() string              // panics if not unmarshaled
-    func (s Secret) String() string             // always "[redacted]"
+    func New(value string) Secret               // already-resolved literal
+    func Resolve(raw string) (Secret, error)    // resolves and keeps the ref
+    func (s Secret) Value() string              // the resolved secret
+    func (s Secret) Ref() string                // "env:VAR", "" for literals
+    func (s Secret) String() string             // ref, else "[redacted]"
     func (s Secret) MarshalText() ([]byte, error)
     func (s *Secret) UnmarshalText([]byte) error
     func (s Secret) MarshalJSON() ([]byte, error)
@@ -301,4 +306,7 @@ Example (YAML/JSON config):
     // { "database_url": "env:DATABASE_URL", "api_key": "file:/run/secrets/api_key" }
 
     cfg.DatabaseURL.Value() // returns the resolved environment variable
-    fmt.Println(cfg.APIKey) // prints "[redacted]"
+    fmt.Println(cfg.APIKey) // prints "file:/run/secrets/api_key"
+
+    // Re-encoding cfg writes the original references back, not the secrets:
+    // { "database_url": "env:DATABASE_URL", "api_key": "file:/run/secrets/api_key" }

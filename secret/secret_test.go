@@ -68,32 +68,140 @@ func TestSecret_FileMissingReturnsError(t *testing.T) {
 	}
 }
 
-func TestSecret_StringAlwaysRedacted(t *testing.T) {
-	s := secret.Secret("super-secret-value")
-	if got := s.String(); got != "[redacted]" {
-		t.Errorf("want [redacted], got %q", got)
-	}
-}
+// A literal value is its own secret, so there is no reference to emit and
+// every outbound representation must redact it.
+func TestSecret_LiteralRedactsEverywhere(t *testing.T) {
+	s := secret.New("super-secret-value")
 
-func TestSecret_MarshalTextRedacts(t *testing.T) {
-	s := secret.Secret("super-secret-value")
-	b, err := s.MarshalText()
+	if got := s.String(); got != "[redacted]" {
+		t.Errorf("String: want [redacted], got %q", got)
+	}
+	if got := s.Ref(); got != "" {
+		t.Errorf("Ref: want empty, got %q", got)
+	}
+
+	text, err := s.MarshalText()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(b) != "[redacted]" {
-		t.Errorf("want [redacted], got %q", string(b))
+	if string(text) != "[redacted]" {
+		t.Errorf("MarshalText: want [redacted], got %q", string(text))
 	}
-}
 
-func TestSecret_MarshalJSONRedacts(t *testing.T) {
-	s := secret.Secret("super-secret-value")
 	b, err := json.Marshal(s)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if string(b) != `"[redacted]"` {
-		t.Errorf("want \"[redacted]\", got %s", string(b))
+		t.Errorf("MarshalJSON: want \"[redacted]\", got %s", string(b))
+	}
+}
+
+// The whole point of the reference: config that names a source marshals back
+// to that source, not to the resolved value and not to "[redacted]".
+func TestSecret_MarshalEmitsSourceReference(t *testing.T) {
+	t.Setenv("ROUNDTRIP_VAR", "super-secret-value")
+
+	var s secret.Secret
+	if err := s.UnmarshalText([]byte("env:ROUNDTRIP_VAR")); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := s.Ref(); got != "env:ROUNDTRIP_VAR" {
+		t.Errorf("Ref: want env:ROUNDTRIP_VAR, got %q", got)
+	}
+	if got := s.String(); got != "env:ROUNDTRIP_VAR" {
+		t.Errorf("String: want env:ROUNDTRIP_VAR, got %q", got)
+	}
+
+	text, err := s.MarshalText()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(text) != "env:ROUNDTRIP_VAR" {
+		t.Errorf("MarshalText: want env:ROUNDTRIP_VAR, got %q", string(text))
+	}
+
+	b, err := json.Marshal(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(b) != `"env:ROUNDTRIP_VAR"` {
+		t.Errorf("MarshalJSON: want \"env:ROUNDTRIP_VAR\", got %s", string(b))
+	}
+	if strings.Contains(string(b), "super-secret-value") {
+		t.Errorf("MarshalJSON leaked the resolved value: %s", b)
+	}
+}
+
+// A file reference marshals back to the path, and decoding the output again
+// resolves to the same value.
+func TestSecret_FileReferenceRoundTrips(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "secret.txt")
+	if err := os.WriteFile(path, []byte("file-value\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var first secret.Secret
+	if err := json.Unmarshal([]byte(`"file:`+path+`"`), &first); err != nil {
+		t.Fatal(err)
+	}
+
+	encoded, err := json.Marshal(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var second secret.Secret
+	if err := json.Unmarshal(encoded, &second); err != nil {
+		t.Fatal(err)
+	}
+	if second.Value() != "file-value" {
+		t.Errorf("want file-value, got %q", second.Value())
+	}
+	if second.Ref() != first.Ref() {
+		t.Errorf("ref changed: %q -> %q", first.Ref(), second.Ref())
+	}
+}
+
+// An unset field must not round-trip into a literal "[redacted]" secret.
+func TestSecret_ZeroValueMarshalsEmpty(t *testing.T) {
+	var s secret.Secret
+
+	if got := s.String(); got != "" {
+		t.Errorf("String: want empty, got %q", got)
+	}
+
+	b, err := json.Marshal(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(b) != `""` {
+		t.Errorf("MarshalJSON: want empty string, got %s", string(b))
+	}
+}
+
+// A reference containing JSON metacharacters must be escaped, not emitted raw.
+func TestSecret_MarshalJSONEscapesReference(t *testing.T) {
+	t.Cleanup(secret.ResetSources)
+	secret.Register("quoted", func(string) (string, error) { return "ok", nil })
+
+	var s secret.Secret
+	if err := s.UnmarshalText([]byte(`quoted:a"b`)); err != nil {
+		t.Fatal(err)
+	}
+
+	b, err := json.Marshal(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var got secret.Secret
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("re-decoding %s: %v", b, err)
+	}
+	if got.Ref() != `quoted:a"b` {
+		t.Errorf(`want quoted:a"b, got %q`, got.Ref())
 	}
 }
 
@@ -257,12 +365,51 @@ func TestSecret_NestedInStruct(t *testing.T) {
 	if cfg.APIKey.Value() != "sk_live_xyz" {
 		t.Errorf("want sk_live_xyz, got %q", cfg.APIKey.Value())
 	}
-	// Round-trip should redact.
+	// Round-trip should restore the reference, not the resolved value.
 	b, err := json.Marshal(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(b), `"[redacted]"`) {
-		t.Errorf("round-trip did not redact: %s", b)
+	if string(b) != `{"api_key":"env:NESTED_KEY"}` {
+		t.Errorf(`want {"api_key":"env:NESTED_KEY"}, got %s`, b)
+	}
+}
+
+func TestNew_HoldsLiteralValue(t *testing.T) {
+	s := secret.New("already-resolved")
+	if s.Value() != "already-resolved" {
+		t.Errorf("want already-resolved, got %q", s.Value())
+	}
+}
+
+func TestResolve_ReturnsValueAndRef(t *testing.T) {
+	t.Setenv("RESOLVE_FN_VAR", "resolved-value")
+
+	cases := []struct {
+		name, in, wantValue, wantRef string
+	}{
+		{"registered prefix", "env:RESOLVE_FN_VAR", "resolved-value", "env:RESOLVE_FN_VAR"},
+		{"unknown prefix", "postgres://user:pw@host/db", "postgres://user:pw@host/db", ""},
+		{"no prefix", "plain", "plain", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, err := secret.Resolve(tc.in)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if s.Value() != tc.wantValue {
+				t.Errorf("value: want %q, got %q", tc.wantValue, s.Value())
+			}
+			if s.Ref() != tc.wantRef {
+				t.Errorf("ref: want %q, got %q", tc.wantRef, s.Ref())
+			}
+		})
+	}
+}
+
+func TestResolve_PropagatesSourceError(t *testing.T) {
+	if _, err := secret.Resolve("file:/nonexistent/secret"); err == nil {
+		t.Fatal("expected error for missing file")
 	}
 }
